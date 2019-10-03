@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -1967,7 +1968,11 @@ func BenchmarkSha512_256x900(b *testing.B) {
 }
 
 func TestEd25519verify(t *testing.T) {
-	t.Parallel()
+	// t.Parallel() // not parallelizable because it grabs global state from logic.nonCacheableEd25519verifyOps and other counters
+	atomic.StoreUint64(&nonCacheableEd25519verifyOps, 0)
+	atomic.StoreUint64(&cachedEd25519verifyOps, 0)
+	atomic.StoreUint64(&cacheHitEd25519verifyOps, 0)
+	atomic.StoreUint64(&cacheMissEd25519verifyOps, 0)
 	var s crypto.Seed
 	crypto.RandBytes(s[:])
 	c := crypto.GenerateSignatureSecrets(s)
@@ -1985,6 +1990,10 @@ ed25519verify`, pkStr))
 	var txn transactions.SignedTxn
 	txn.Lsig.Logic = program
 	txn.Lsig.Args = [][]byte{data[:], sig[:]}
+	_, err = Check(program, EvalParams{Txn: &txn})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), atomic.LoadUint64(&nonCacheableEd25519verifyOps))
+	require.Equal(t, uint64(1), atomic.LoadUint64(&cachedEd25519verifyOps))
 	sb := strings.Builder{}
 	ep := EvalParams{Txn: &txn, Trace: &sb}
 	pass, err := Eval(program, ep)
@@ -1994,9 +2003,12 @@ ed25519verify`, pkStr))
 	}
 	require.True(t, pass)
 	require.NoError(t, err)
+	require.Equal(t, uint64(1), atomic.LoadUint64(&cacheHitEd25519verifyOps))
 
 	// short sig will fail
 	txn.Lsig.Args[1] = sig[1:]
+	_, err = Check(program, EvalParams{Txn: &txn})
+	require.Error(t, err)
 	pass, err = Eval(program, EvalParams{Txn: &txn})
 	require.False(t, pass)
 	require.Error(t, err)
@@ -2006,11 +2018,15 @@ ed25519verify`, pkStr))
 	data1, err := hex.DecodeString(msg1)
 	require.NoError(t, err)
 	txn.Lsig.Args = [][]byte{data1, sig[:]}
+	_, err = Check(program, EvalParams{Txn: &txn})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), atomic.LoadUint64(&cachedEd25519verifyOps))
 	sb1 := strings.Builder{}
 	ep1 := EvalParams{Txn: &txn, Trace: &sb1}
 	pass1, err := Eval(program, ep1)
 	require.False(t, pass1)
 	require.NoError(t, err)
+	require.Equal(t, uint64(2), atomic.LoadUint64(&cacheHitEd25519verifyOps))
 }
 
 func BenchmarkEd25519Verifyx1(b *testing.B) {

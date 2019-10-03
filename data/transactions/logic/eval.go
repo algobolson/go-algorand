@@ -25,9 +25,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/big"
 	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/sha3"
 
@@ -118,6 +122,12 @@ type evalContext struct {
 	// Ordered set of pc values that a branch could go to.
 	// If Check pc skips a target, the source branch was invalid!
 	branchTargets []int
+
+	// record what pc was
+	pcLog []int
+
+	// where was the last bytecblock
+	bytecPc int
 }
 
 type opFunc func(cx *evalContext)
@@ -216,6 +226,7 @@ func Eval(program []byte, params EvalParams) (pass bool, err error) {
 // Returns 'cost' which is an estimate of relative execution time.
 func Check(program []byte, params EvalParams) (cost int, err error) {
 	var cx evalContext
+	cx.bytecPc = -1
 	version, vlen := binary.Uvarint(program)
 	if version > EvalMaxVersion {
 		err = fmt.Errorf("program version %d greater than max supported version %d", version, EvalMaxVersion)
@@ -230,6 +241,7 @@ func Check(program []byte, params EvalParams) (cost int, err error) {
 	cx.EvalParams = params
 	cx.checkStack = make([]StackType, 0, 10)
 	cx.program = program
+	cx.pcLog = make([]int, 0, len(cx.program))
 	for (cx.err == nil) && (cx.pc < len(cx.program)) {
 		cost += cx.checkStep()
 	}
@@ -351,7 +363,7 @@ var opSizes = []opSize{
 	{"sha256", 7, 1, nil},
 	{"keccak256", 26, 1, nil},
 	{"sha512_256", 9, 1, nil},
-	{"ed25519verify", 1900, 1, nil},
+	{"ed25519verify", 1900, 1, checkEd25519verify},
 	{"rand", 3, 1, nil},
 	{"bnz", 1, 3, checkBnz},
 	{"intc", 1, 2, nil},
@@ -444,6 +456,9 @@ func (cx *evalContext) step() {
 }
 
 func (cx *evalContext) checkStep() (cost int) {
+	if cx.pcLog != nil {
+		cx.pcLog = append(cx.pcLog, cx.pc)
+	}
 	opcode := cx.program[cx.pc]
 	if opsByOpcode[opcode].op == nil {
 		cx.err = fmt.Errorf("%3d illegal opcode %02x", cx.pc, opcode)
@@ -1085,32 +1100,167 @@ func opGlobal(cx *evalContext) {
 	cx.nextpc = cx.pc + 2
 }
 
+func getOpByteconstant(cx *evalContext, pc int) []byte {
+	var err error
+	if cx.bytec == nil || cx.bytecPc != -1 {
+		cx.bytec, _, err = parseBytecBlock(cx.program, cx.bytecPc)
+		if err != nil {
+			log.Print(err)
+			return nil
+		}
+	}
+	scx := *cx
+	scx.pc = pc
+	scx.stack = make([]stackValue, 0, 1)
+	scx.Trace = nil
+	scx.branchTargets = nil
+	scx.pcLog = nil
+	sb := strings.Builder{}
+	scx.Trace = &sb
+	log.Printf("cx bytec=%d scx.bytec=%d", len(cx.bytec), len(scx.bytec))
+	scx.step()
+	log.Print(sb.String())
+	if scx.err != nil {
+		log.Print(scx.err)
+		return nil
+	}
+	if len(scx.stack) == 0 {
+		log.Print("no stack")
+		return nil
+	}
+	return scx.stack[0].Bytes
+}
+
+type ed25519verifyCacheEntry struct {
+	key, signature, data []byte
+
+	result uint64
+}
+
+func (ce ed25519verifyCacheEntry) match(key, signature, data []byte) (result uint64, ok bool) {
+	ok = bytes.Equal(ce.key, key) && bytes.Equal(ce.signature, signature) && bytes.Equal(ce.data, data)
+	if ok {
+		result = ce.result
+	}
+	return
+}
+
+// TODO: round based generation cache
+const ed25519verifyCacheSize = 1000
+
+type ed25519verifyCache struct {
+	ring [ed25519verifyCacheSize]ed25519verifyCacheEntry
+	next int
+	lock sync.RWMutex
+}
+
+func (vc *ed25519verifyCache) put(key, signature, data []byte, result uint64) {
+	vc.lock.Lock()
+	defer vc.lock.Unlock()
+	vc.ring[vc.next].key = key
+	vc.ring[vc.next].signature = signature
+	vc.ring[vc.next].data = data
+	vc.ring[vc.next].result = result
+	vc.next = (vc.next + 1) % ed25519verifyCacheSize
+}
+
+func (vc *ed25519verifyCache) get(key, signature, data []byte) (result uint64, ok bool) {
+	vc.lock.RLock()
+	defer vc.lock.RUnlock()
+	pos := vc.next
+	for true {
+		pos = (pos + ed25519verifyCacheSize - 1) % ed25519verifyCacheSize
+		result, ok = vc.ring[pos].match(key, signature, data)
+		if ok {
+			return
+		}
+		if pos == vc.next {
+			break
+		}
+	}
+	return 0, false
+}
+
+var verifyCache ed25519verifyCache
+var nonCacheableEd25519verifyOps uint64 = 0
+var cachedEd25519verifyOps uint64 = 0
+var cacheHitEd25519verifyOps uint64 = 0
+var cacheMissEd25519verifyOps uint64 = 0
+
+func checkEd25519verify(cx *evalContext) (cost int) {
+	opcode := cx.program[cx.pc]
+	oz := opSizeByOpcode[opcode]
+	cost = oz.cost
+
+	var args [3][]byte
+	opx := len(cx.pcLog) - 4
+	for i := 0; i < 3; i++ {
+		args[i] = getOpByteconstant(cx, cx.pcLog[opx+i])
+		if args[i] == nil {
+			log.Printf("args[%d] failed", i)
+			// cannot optimize
+			// TODO: count/log how many we can/cannot precompute
+			atomic.AddUint64(&nonCacheableEd25519verifyOps, 1)
+			return
+		}
+	}
+	result, ok := verifyCache.get(args[2], args[1], args[0])
+	if ok {
+		return
+	}
+	result, err := innerEd25519verify(args[2], args[1], args[0])
+	if err != nil {
+		cx.err = err
+	} else {
+		verifyCache.put(args[2], args[1], args[0], result)
+		atomic.AddUint64(&cachedEd25519verifyOps, 1)
+	}
+	return
+}
+func innerEd25519verify(key, signature, data []byte) (uint64, error) {
+	var sv crypto.SignatureVerifier
+	if len(key) != len(sv) {
+		return 0, errors.New("invalid public key")
+	}
+	copy(sv[:], key)
+
+	var sig crypto.Signature
+	if len(signature) != len(sig) {
+		return 0, errors.New("invalid signature")
+	}
+	copy(sig[:], signature)
+
+	if sv.VerifyBytes(data, sig) {
+		return 1, nil
+	} else {
+		return 0, nil
+	}
+}
 func opEd25519verify(cx *evalContext) {
 	last := len(cx.stack) - 1 // index of PK
 	prev := last - 1          // index of signature
 	pprev := prev - 1         // index of data
 
-	var sv crypto.SignatureVerifier
-	if len(cx.stack[last].Bytes) != len(sv) {
-		cx.err = errors.New("invalid public key")
+	ok, hit := verifyCache.get(cx.stack[last].Bytes, cx.stack[prev].Bytes, cx.stack[pprev].Bytes)
+	if hit {
+		cx.stack[pprev].Uint = ok
+		cx.stack[pprev].Bytes = nil
+		cx.stack = cx.stack[:prev]
+		atomic.AddUint64(&cacheHitEd25519verifyOps, 1)
 		return
-	}
-	copy(sv[:], cx.stack[last].Bytes)
-
-	var sig crypto.Signature
-	if len(cx.stack[prev].Bytes) != len(sig) {
-		cx.err = errors.New("invalid signature")
-		return
-	}
-	copy(sig[:], cx.stack[prev].Bytes)
-
-	if sv.VerifyBytes(cx.stack[pprev].Bytes, sig) {
-		cx.stack[pprev].Uint = 1
 	} else {
-		cx.stack[pprev].Uint = 0
+		atomic.AddUint64(&cacheMissEd25519verifyOps, 1)
 	}
-	cx.stack[pprev].Bytes = nil
-	cx.stack = cx.stack[:prev]
+
+	ok, err := innerEd25519verify(cx.stack[last].Bytes, cx.stack[prev].Bytes, cx.stack[pprev].Bytes)
+
+	if err == nil {
+		cx.stack[pprev].Uint = ok
+		cx.stack[pprev].Bytes = nil
+		cx.stack = cx.stack[:prev]
+	} else {
+		cx.err = err
+	}
 }
 
 func opLoad(cx *evalContext) {

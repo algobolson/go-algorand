@@ -883,6 +883,7 @@ func parseBytecBlock(program []byte, pc int) (bytec [][]byte, nextpc int, err er
 }
 
 func checkByteConstBlock(cx *evalContext) int {
+	cx.bytecPc = cx.pc
 	pos := cx.pc + 1
 	numItems, bytesUsed := binary.Uvarint(cx.program[pos:])
 	if bytesUsed <= 0 {

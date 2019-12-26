@@ -17,6 +17,7 @@
 package pools
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -49,9 +50,6 @@ type TransactionPool struct {
 	expFeeFactor           uint64
 	txPoolMaxSize          int
 
-	pendingBlocks []*ledger.ValidatedBlock
-	baseRound     basics.Round // round before pendingBlocks[0]
-
 	// pendingMu protects pendingTxGroups and pendingTxids
 	pendingMu           deadlock.RWMutex
 	pendingTxGroups     [][]transactions.SignedTxn
@@ -67,8 +65,32 @@ type TransactionPool struct {
 	rememberedVerifyParams [][]verify.Params
 	rememberedTxids        map[transactions.Txid]txPoolVerifyCacheVal
 
-	// Stats for when achieving AssemblePayset
+	// separate lock for when we need the block to be proposed
+	proposerLock     deadlock.Mutex
+	proposerRound    basics.Round
+	proposerResult   chan<- *BlockProposal
+	proposalDeadline time.Time
+
+	// blocks we completed, in case StartProposeBlock() happens after we already finished a block
+	pendingBlocks []*proposableEvaluator
+	baseRound     basics.Round // round before pendingBlocks[0]
+
+	// Stats for when proposing a block
 	stats telemetryspec.AssembleBlockStats
+}
+
+// BlockProposal contains an assembled Block to propose to the network
+type BlockProposal struct {
+	Block *ledger.ValidatedBlock
+	Stats telemetryspec.AssembleBlockStats
+	Error error
+}
+
+type proposableEvaluator struct {
+	eval  *ledger.BlockEvaluator
+	stats telemetryspec.AssembleBlockStats
+	err   error
+	block *ledger.ValidatedBlock
 }
 
 // MakeTransactionPool is the constructor, it uses Ledger to ensure that no account has pending transactions that together overspend.
@@ -495,14 +517,98 @@ func (pool *TransactionPool) addToPendingBlockEvaluatorOnce(txgroup []transactio
 	return pool.pendingBlockEvaluator.TransactionGroup(txgroupad)
 }
 
+// StartProposeBlock sets up the TransactionPool to yield a block for proposal
+func (pool *TransactionPool) StartProposeBlock(round basics.Round, deadline time.Time, out chan<- *BlockProposal) {
+	pool.proposerLock.Lock()
+	defer pool.proposerLock.Unlock()
+	if pool.proposerResult != nil && pool.proposerRound != round {
+		logging.Base().Errorf("double StartProposeBlock for rounds %d and %d", pool.proposerResult, round)
+		return
+	}
+	for _, pb := range pool.pendingBlocks {
+		if pb.block != nil && pb.block.Block().Round() == round {
+			logging.Base().Infof("StartProposeBlock for round %d already done with built block", round)
+			out <- &BlockProposal{
+				pb.block,
+				pb.stats,
+				pb.err,
+			}
+			close(out)
+			pool.proposerResult = nil
+			return
+		}
+		if pb.eval.Round() == round {
+			logging.Base().Infof("StartProposeBlock for round %d already done with eval", round)
+			err := pb.err
+			var block *ledger.ValidatedBlock
+			if err == nil {
+				block, err = pb.eval.GenerateBlock()
+			}
+			out <- &BlockProposal{
+				block,
+				pb.stats,
+				err,
+			}
+			close(out)
+			pool.proposerResult = nil
+			return
+		}
+	}
+	pool.proposerRound = round
+	pool.proposerResult = out
+	pool.proposalDeadline = deadline
+	logging.Base().Infof("StartProposeBlock for round %d waiting", round)
+}
+
+func (pool *TransactionPool) proposalDeadlineExceeded() bool {
+	pool.proposerLock.Lock()
+	defer pool.proposerLock.Unlock()
+	if pool.proposerResult == nil {
+		return false
+	}
+	return time.Now().After(pool.proposalDeadline)
+}
+
+func (pool *TransactionPool) maybeProposeBlock() {
+	pool.proposerLock.Lock()
+	defer pool.proposerLock.Unlock()
+	if pool.proposerResult == nil {
+		pool.pendingBlocks = append(pool.pendingBlocks, &proposableEvaluator{eval: pool.pendingBlockEvaluator, stats: pool.stats})
+		return
+	}
+	block, err := pool.pendingBlockEvaluator.GenerateBlock()
+	if err == nil {
+		blockround := block.Block().Round()
+		if blockround < pool.proposerRound {
+			logging.Base().Infof("maybeProposeBlock round %d remembered", blockround)
+			// nothing, wait, maybe we'll get there next time.
+			pool.pendingBlocks = append(pool.pendingBlocks, &proposableEvaluator{eval: pool.pendingBlockEvaluator, stats: pool.stats, block: block})
+			return
+		}
+		if blockround > pool.proposerRound {
+			logging.Base().Errorf("maybeProposeBlock for round %d when %d requested", blockround, pool.proposerRound)
+			err = errors.New("TransactionPool wrong round")
+			block = nil
+		}
+	}
+	pool.proposerResult <- &BlockProposal{
+		block,
+		pool.stats,
+		err,
+	}
+	close(pool.proposerResult)
+	pool.proposerResult = nil
+	logging.Base().Infof("maybeProposeBlock round %d DONE", pool.proposerRound)
+}
+
 func (pool *TransactionPool) addToPendingBlockEvaluator(txgroup []transactions.SignedTxn) error {
 	err := pool.addToPendingBlockEvaluatorOnce(txgroup)
 	if err == ledger.ErrNoSpace {
-		// TODO: if in proposer mode return the block
 		pool.stats.StopReason = telemetryspec.AssembleBlockFull
+		pool.maybeProposeBlock()
 
 		pool.numPendingWholeBlocks++
-		pool.pendingBlockEvaluator.ResetTxnBytes()
+		pool.setupBlockEvaluator(pool.pendingBlockEvaluator.BlockHeader())
 		err = pool.addToPendingBlockEvaluatorOnce(txgroup)
 	}
 	return err
@@ -513,9 +619,20 @@ type blockStats struct {
 	EarlyCommittedCount int
 }
 
+func (pool *TransactionPool) setupBlockEvaluator(prev bookkeeping.BlockHeader) (err error) {
+	next := bookkeeping.MakeBlock(prev)
+	// TODO: use verifactionPool? just use `pool` and not alwaysVerifiedPool
+	pool.pendingBlockEvaluator, err = pool.ledger.StartEvaluator(next.BlockHeader, &alwaysVerifiedPool{pool}, nil)
+	pool.stats = telemetryspec.AssembleBlockStats{}
+	pool.stats.StopReason = telemetryspec.AssembleBlockEmpty
+	return
+}
+
 // recomputeBlockEvaluator constructs a new BlockEvaluator and feeds all
 // in-pool transactions to it (removing any transactions that are rejected
 // by the BlockEvaluator).
+//
+// pool.mu is already held when calling this.
 func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transactions.Txid]basics.Round) (rstats telemetryspec.ProcessBlockMetrics) {
 	pool.pendingBlockEvaluator = nil
 
@@ -542,10 +659,10 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 		return
 	}
 
-	next := bookkeeping.MakeBlock(prev)
 	pool.numPendingWholeBlocks = 0
+	err = pool.setupBlockEvaluator(prev)
 	// TODO: use verifactionPool? just use `pool` and not alwaysVerifiedPool
-	pool.pendingBlockEvaluator, err = pool.ledger.StartEvaluator(next.BlockHeader, &alwaysVerifiedPool{pool}, nil)
+	//pool.pendingBlockEvaluator, err = pool.ledger.StartEvaluator(next.BlockHeader, &alwaysVerifiedPool{pool}, nil)
 	if err != nil {
 		logging.Base().Warnf("TransactionPool.recomputeBlockEvaluator: cannot start evaluator: %v", err)
 		return
@@ -566,8 +683,6 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 	first := true
 	totalFees := uint64(0)
 
-	var deadline time.Time
-
 	for i, txgroup := range txgroups {
 		if len(txgroup) == 0 {
 			pool.stats.InvalidCount++
@@ -577,9 +692,11 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 			pool.stats.EarlyCommittedCount++
 			continue
 		}
-		if (!deadline.IsZero()) && time.Now().After(deadline) {
+		if pool.proposalDeadlineExceeded() {
 			pool.stats.StopReason = telemetryspec.AssembleBlockTimeout
-			break
+			pool.maybeProposeBlock()
+			pool.numPendingWholeBlocks++
+			pool.setupBlockEvaluator(pool.pendingBlockEvaluator.BlockHeader())
 		}
 		err := pool.add(txgroup, verifyParams[i])
 		// err == ledger.ErrNoSpace is handled within pool.add()
@@ -645,6 +762,7 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 			}
 		}
 	}
+	pool.maybeProposeBlock()
 
 	pool.rememberCommit(true)
 	return

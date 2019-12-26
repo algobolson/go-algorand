@@ -333,6 +333,11 @@ func (eval *BlockEvaluator) Round() basics.Round {
 	return eval.block.Round()
 }
 
+// BlockHeader copies back out the BlockHeader used in StartEvaluator
+func (eval *BlockEvaluator) BlockHeader() bookkeeping.BlockHeader {
+	return eval.block.BlockHeader
+}
+
 // ResetTxnBytes resets the number of bytes tracked by the BlockEvaluator to
 // zero.  This is a specialized operation used by the transaction pool to
 // simulate the effect of putting pending transactions in multiple blocks.

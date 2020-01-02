@@ -91,32 +91,7 @@ func makeBlockFactory(l *data.Ledger, tp *pools.TransactionPool, logStats bool, 
 func (i *blockFactoryImpl) AssembleBlock(round basics.Round, deadline time.Time) (agreement.ValidatedBlock, error) {
 	start := time.Now()
 
-	/*
-		prev, err := i.l.BlockHdr(round - 1)
-		if err != nil {
-			return nil, fmt.Errorf("could not make proposals at round %d: could not read block from ledger: %v", round, err)
-		}
-
-		newEmptyBlk := bookkeeping.MakeBlock(prev)
-
-		eval, err := i.l.StartEvaluator(newEmptyBlk.BlockHeader, i.tp, i.verificationPool)
-		if err != nil {
-			return nil, fmt.Errorf("could not make proposals at round %d: could not start evaluator: %v", round, err)
-		}
-
-		var stats telemetryspec.AssembleBlockMetrics
-		stats.AssembleBlockStats = i.l.AssemblePayset(i.tp, eval, deadline)
-
-		// Measure time here because we want to know how close to deadline we are
-		dt := time.Now().Sub(start)
-		stats.AssembleBlockStats.Nanoseconds = dt.Nanoseconds()
-
-		lvb, err := eval.GenerateBlock()
-		if err != nil {
-			return nil, fmt.Errorf("could not make proposals at round %d: could not finish evaluator: %v", round, err)
-		}
-	*/
-	result := make(chan *pools.BlockProposal)
+	result := make(chan *pools.BlockProposal, 1)
 	i.tp.StartProposeBlock(round, deadline, result)
 	proposal, ok := <-result
 	if !ok {

@@ -112,7 +112,7 @@ func MakeTransactionPool(ledger *ledger.Ledger, cfg config.Local) *TransactionPo
 		txPoolMaxSize:   cfg.TxPoolSize,
 	}
 	pool.cond.L = &pool.mu
-	// TODO: lookup txid from last 1000 rounds
+	// everything is empty, this 'recompute' is just consistent setup
 	pool.recomputeBlockEvaluator(make(map[transactions.Txid]basics.Round))
 	return &pool
 }
@@ -661,8 +661,6 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 
 	pool.numPendingWholeBlocks = 0
 	err = pool.setupBlockEvaluator(prev)
-	// TODO: use verifactionPool? just use `pool` and not alwaysVerifiedPool
-	//pool.pendingBlockEvaluator, err = pool.ledger.StartEvaluator(next.BlockHeader, &alwaysVerifiedPool{pool}, nil)
 	if err != nil {
 		logging.Base().Warnf("TransactionPool.recomputeBlockEvaluator: cannot start evaluator: %v", err)
 		return
@@ -675,8 +673,6 @@ func (pool *TransactionPool) recomputeBlockEvaluator(committedTxIds map[transact
 	verifyParams := pool.pendingVerifyParams
 	pool.pendingMu.RUnlock()
 
-	// TODO: be more like data/ledger.go AssemblePayset
-	// prevRoundTxIds := l.GetRoundTxIds(l.Latest())
 	pool.stats = telemetryspec.AssembleBlockStats{}
 	pool.stats.StartCount = len(txgroups)
 	pool.stats.StopReason = telemetryspec.AssembleBlockEmpty
